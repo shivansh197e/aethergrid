@@ -6,6 +6,8 @@ from app.application.services.assign_worker_service import (
 from app.application.services.record_job_events_service import (
     RecordJobEventsService,
 )
+from app.domain.entities.job import Job
+from app.domain.entities.node import Node
 from app.domain.enums.job_status import JobStatus
 from app.domain.exceptions.no_available_node_error import (
     NoAvailableNodeError,
@@ -95,28 +97,35 @@ class SchedulerLoopService:
                     )
                 except NoAvailableNodeError:
                     # The node had capacity, but no idle worker was
-                    # registered on it yet (e.g. an agent hadn't
-                    # finished starting up). The job was already
-                    # saved as SCHEDULED above, which permanently
-                    # removes it from this method's own QUEUED
-                    # filter -- without this, it would never be
-                    # revisited by any future tick, even once a
-                    # worker does become available. Undo the
-                    # scheduling decision and give the node's
-                    # capacity back so the job is retried on the
-                    # very next tick instead of being stranded.
-                    job.unschedule()
-                    node.release(
-                        job.resources,
-                    )
-                    self._node_repository.save(
-                        node,
-                    )
-                    self._job_repository.save(
-                        job,
-                    )
-                    if self._record_job_events_service is not None:
-                        self._record_job_events_service.record_for_job(
-                            job,
-                            event_type="JobUnscheduled",
-                        )
+                    # registered on it yet. Undo scheduling so the job
+                    # is retried on the next tick instead of being stranded.
+                    self._rollback_scheduling(job, node)
+                except Exception:
+                    # Any other assignment failure (e.g. WorkerNotFoundError
+                    # when a worker vanishes mid-assignment, or a lease
+                    # persistence error) would otherwise leave the job
+                    # stranded in SCHEDULED with no lease and leaked node
+                    # capacity. Roll back before propagating.
+                    self._rollback_scheduling(job, node)
+                    raise
+
+    def _rollback_scheduling(
+        self,
+        job: Job,
+        node: Node,
+    ) -> None:
+        job.unschedule()
+        node.release(
+            job.resources,
+        )
+        self._node_repository.save(
+            node,
+        )
+        self._job_repository.save(
+            job,
+        )
+        if self._record_job_events_service is not None:
+            self._record_job_events_service.record_for_job(
+                job,
+                event_type="JobUnscheduled",
+            )
